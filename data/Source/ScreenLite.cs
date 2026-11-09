@@ -82,16 +82,22 @@ internal sealed class RecorderForm : Form
     private readonly ComboBox resolutions = new ComboBox();
     private readonly ComboBox profiles = new ComboBox();
     private readonly ComboBox frameRates = new ComboBox();
-    private readonly Button settingsButton;
+    private readonly ContextMenuStrip actions = new ContextMenuStrip();
+    private readonly ToolStripMenuItem editItem;
+    private readonly ToolStripMenuItem settingsItem;
+    private readonly ToolStripMenuItem updateItem;
+    private readonly ToolStripMenuItem testItem;
+    private readonly ToolStripMenuItem panelItem;
+    private readonly Button menuButton;
+    private bool preparingUpdate;
+    private string testDirectory;
     private readonly Button pauseButton;
     private readonly CheckBox mic = new CheckBox();
     private readonly CheckBox enhance = new CheckBox();
     private readonly Button appsButton;
-    private readonly Button editButton;
     private readonly TextBox folder = new TextBox();
     private readonly Label estimate = new Label();
     private readonly Label loadEstimate = new Label();
-    private readonly Button lightButton;
     private readonly ToolTip hints = new ToolTip();
     private readonly Label status = new Label();
     private readonly Label hotkeyLabel = new Label();
@@ -127,7 +133,7 @@ internal sealed class RecorderForm : Form
     {
         Text = "ScreenLite";
         Font = new Font("Segoe UI", 10);
-        ClientSize = new Size(510, 657);
+        ClientSize = new Size(510, 609);
         AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -136,8 +142,10 @@ internal sealed class RecorderForm : Form
         BackColor = Color.FromArgb(24, 30, 39);
         ForeColor = Color.WhiteSmoke;
 
-        Label title = AddLabel("ScreenLite", 22, 16, 465, 35, ForeColor);
+        Label title = AddLabel("ScreenLite", 22, 16, 360, 35, ForeColor);
         title.Font = new Font("Segoe UI Semibold", 20);
+        menuButton = AddButton("Меню ▾", 393, 19, 93, 31, false,
+            delegate { actions.Show(menuButton, new Point(0, menuButton.Height)); });
         AddLabel("Запись экрана и звука  •  до 144 FPS  •  MP4", 24, 54, 462, 24, MutedColor);
 
         AddLabel("Экран", 24, 97, 132, 24, MutedColor);
@@ -165,9 +173,6 @@ internal sealed class RecorderForm : Form
         Controls.Add(loadEstimate);
         hints.SetToolTip(loadEstimate, "Оценка по разрешению, FPS и способу записи звука. Реальная нагрузка зависит от GPU, игры и числа источников.");
         hints.SetToolTip(estimate, "Ориентир по битрейту. Фактический размер зависит от движения в кадре.");
-        lightButton = AddButton("Лёгкий режим", 331, 286, 155, 31, false, ApplyLightPreset);
-        hints.SetToolTip(lightButton, "720p · 30 FPS · компактный MP4 · общий звук без обработки и раздельных дорожек.");
-
         mic.Text = "Записывать микрофон";
         mic.Checked = true;
         mic.SetBounds(24, 340, 210, 30);
@@ -187,17 +192,27 @@ internal sealed class RecorderForm : Form
         folder.BorderStyle = BorderStyle.FixedSingle;
         Controls.Add(folder);
         browseButton = AddButton("…", 451, 426, 35, 31, false, BrowseFolder);
-        AddButton("Открыть папку", 24, 472, 132, 37, false, OpenFolder);
-        pauseButton = AddButton("Пауза", 164, 472, 114, 37, false, TogglePause);
+        pauseButton = AddButton("Пауза", 24, 472, 150, 37, false, TogglePause);
         pauseButton.Enabled = false;
-        recordButton = AddButton("Начать запись", 286, 472, 200, 37, true, ToggleRecording);
-        editButton = AddButton("Изменить звук записи…", 24, 519, 248, 36, false, EditSavedAudio);
-        settingsButton = AddButton("Клавиши и мини-панель", 280, 519, 206, 36, false, EditSettings);
-        status.SetBounds(24, 576, 462, 25);
+        recordButton = AddButton("Начать запись", 183, 472, 303, 37, true, ToggleRecording);
+        actions.Items.Add("Открыть папку", null, delegate { OpenFolder(); });
+        editItem = (ToolStripMenuItem)actions.Items.Add("Изменить звук записи…", null, delegate { EditSavedAudio(); });
+        actions.Items.Add("Лёгкий режим · 720p / 30 FPS", null, delegate { ApplyLightPreset(); });
+        settingsItem = (ToolStripMenuItem)actions.Items.Add("Горячие клавиши и мини-плеер…", null, delegate { EditSettings(); });
+        panelItem = (ToolStripMenuItem)actions.Items.Add("Показать мини-плеер", null, delegate { ShowRecordingPanel(true); ShowElapsed(); });
+        testItem = (ToolStripMenuItem)actions.Items.Add("Начать тест записи", null, delegate { ToggleRecording(testDirectory == null); });
+        updateItem = (ToolStripMenuItem)actions.Items.Add("Обновить ScreenLite", null, delegate { UpdateApplication(); });
+        actions.Opening += delegate
+        {
+            panelItem.Visible = active && !stopping;
+            testItem.Enabled = !stopping && (recorder == null || testDirectory != null);
+            testItem.Text = testDirectory == null ? "Начать тест записи" : "Завершить тест и удалить запись";
+        };
+        status.SetBounds(24, 528, 462, 25);
         status.AutoEllipsis = true;
         status.Text = "Готово к записи";
         Controls.Add(status);
-        hotkeyLabel.SetBounds(24, 607, 462, 42);
+        hotkeyLabel.SetBounds(24, 559, 462, 42);
         hotkeyLabel.ForeColor = MutedColor;
         Controls.Add(hotkeyLabel);
 
@@ -214,7 +229,7 @@ internal sealed class RecorderForm : Form
         timer.Interval = 500;
         timer.Tick += delegate { if (active && !stopping) ShowElapsed(); };
         FormClosing += OnFormClosing;
-        FormClosed += delegate { timer.Dispose(); hints.Dispose(); };
+        FormClosed += delegate { timer.Dispose(); hints.Dispose(); actions.Dispose(); };
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -257,6 +272,7 @@ internal sealed class RecorderForm : Form
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 var updated = dialog.Settings;
                 updated.FrameRate = SelectedFrameRate;
+                updated.PanelTopMost = preferences.PanelTopMost;
                 RegisterShortcuts(updated);
                 if (!recordKeyRegistered || !pauseKeyRegistered)
                 {
@@ -395,14 +411,16 @@ internal sealed class RecorderForm : Form
         catch (Exception error) { ShowError(error.Message); }
     }
 
-    private void ToggleRecording()
+    private void ToggleRecording() { ToggleRecording(false); }
+
+    private void ToggleRecording(bool test)
     {
         if (stopping || dialogOpen) return;
         if (recorder != null) StopRecording();
-        else StartRecording();
+        else StartRecording(test);
     }
 
-    private void StartRecording()
+    private void StartRecording(bool test)
     {
         try
         {
@@ -415,8 +433,10 @@ internal sealed class RecorderForm : Form
             if (mic.Checked && Recorder.GetSystemAudioCaptureDevices().Count == 0)
                 throw new InvalidOperationException("Микрофон недоступен. Снимите галочку, чтобы записать системный звук.");
 
-            Directory.CreateDirectory(folder.Text);
-            finalPath = Path.Combine(folder.Text, "ScreenLite " + DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss-fff") + ".mp4");
+            if (test) testDirectory = Path.Combine(Path.GetTempPath(), "ScreenLite-test-" + Guid.NewGuid().ToString("N"));
+            string destination = testDirectory ?? folder.Text;
+            Directory.CreateDirectory(destination);
+            finalPath = Path.Combine(destination, "ScreenLite " + DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss-fff") + ".mp4");
             pendingPath = Path.ChangeExtension(finalPath, ".recording.mp4");
             if (File.Exists(finalPath) || File.Exists(pendingPath) || Directory.Exists(AudioProject.DirectoryFor(finalPath)))
             {
@@ -448,7 +468,13 @@ internal sealed class RecorderForm : Form
                 audioProject.DeleteTemporaryTracks();
                 audioProject = null;
             }
-            ShowError(error.Message);
+            string message = error.Message;
+            if (testDirectory != null)
+            {
+                try { CleanupTest(); }
+                catch (Exception cleanup) { message += "\n" + cleanup.Message; }
+            }
+            ShowError(message);
         }
     }
 
@@ -474,7 +500,7 @@ internal sealed class RecorderForm : Form
                 {
                     panelAttempted = true;
                     ShowRecordingPanel();
-                    if (recordKeyRegistered) WindowState = FormWindowState.Minimized;
+                    if (recordKeyRegistered && testDirectory == null) WindowState = FormWindowState.Minimized;
                 }
                 timer.Start();
             }
@@ -483,9 +509,14 @@ internal sealed class RecorderForm : Form
         });
     }
 
-    private void ShowRecordingPanel()
+    private void ShowRecordingPanel(bool force = false)
     {
-        if (!preferences.ShowPanel) return;
+        if (!preferences.ShowPanel && !force) return;
+        if (recordingPanel != null)
+        {
+            recordingPanel.Show();
+            return;
+        }
         var panel = new RecordingPanel(preferences);
         AudioTrack[] tracks = audioProject == null ? new AudioTrack[0] : audioProject.Tracks;
         if (panel.ShowOn(screens[displays.SelectedIndex], preferences.PanelCorner, tracks))
@@ -513,7 +544,7 @@ internal sealed class RecorderForm : Form
 
     private void ShowElapsed()
     {
-        status.Text = (paused ? "Ⅱ Пауза   " : "● Запись   ") + elapsed.Elapsed.ToString(@"hh\:mm\:ss");
+        status.Text = (testDirectory != null ? "Тест · " : "") + (paused ? "Ⅱ Пауза   " : "● Запись   ") + elapsed.Elapsed.ToString(@"hh\:mm\:ss");
         if (recordingPanel == null) return;
         if (!paused || observedBytes == 0)
         {
@@ -632,13 +663,29 @@ internal sealed class RecorderForm : Form
                 });
             }
             else File.Move(pendingPath, finalPath);
-            latestVideo = finalPath;
-            status.Text = "Сохранено  ·  " + Path.GetFileName(finalPath);
+            if (testDirectory == null)
+            {
+                latestVideo = finalPath;
+                status.Text = "Сохранено  ·  " + Path.GetFileName(finalPath);
+            }
+            else
+            {
+                CleanupTest();
+                status.Text = "Тест завершён · пробная запись удалена";
+            }
         }
         catch (Exception failure)
         {
             if (project != null) project.Dispose();
             string message = failure.Message;
+            if (testDirectory != null)
+            {
+                if (project != null) project.DeleteTemporaryTracks();
+                try { CleanupTest(); }
+                catch (Exception cleanup) { message += "\n" + cleanup.Message; }
+                ShowError(message);
+                return;
+            }
             if (File.Exists(pendingPath))
             {
                 try
@@ -746,6 +793,61 @@ internal sealed class RecorderForm : Form
         finally { FinishBusyOperation(); }
     }
 
+    private void CleanupTest()
+    {
+        string directory = testDirectory;
+        testDirectory = null;
+        if (directory == null || !Directory.Exists(directory)) return;
+        try
+        {
+            if (Path.GetDirectoryName(finalPath) == directory)
+            {
+                File.Delete(finalPath);
+                File.Delete(pendingPath);
+            }
+            string tracks = AudioProject.DirectoryFor(finalPath);
+            if (Path.GetDirectoryName(tracks) == directory && Directory.Exists(tracks))
+            {
+                foreach (string file in Directory.EnumerateFiles(tracks, "*.pcmtrack")) File.Delete(file);
+                File.Delete(Path.Combine(tracks, "tracks.xml"));
+                Directory.Delete(tracks);
+            }
+            Directory.Delete(directory);
+        }
+        catch (Exception error)
+        {
+            throw new IOException("Не удалось удалить файлы теста в " + directory, error);
+        }
+    }
+
+    private async void UpdateApplication()
+    {
+        if (recorder != null || stopping || dialogOpen) return;
+        dialogOpen = true;
+        preparingUpdate = true;
+        menuButton.Enabled = appsButton.Enabled = recordButton.Enabled = false;
+        string oldStatus = status.Text;
+        status.Text = "Проверяем обновления…";
+        try
+        {
+            bool updating = await Task.Run(() => ScreenLiteUpdate.Start());
+            preparingUpdate = false;
+            if (updating) Close();
+            else MessageBox.Show(this, "Установлена актуальная версия ScreenLite.", Text);
+        }
+        catch (Exception error) { MessageBox.Show(this, error.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                status.Text = oldStatus;
+                preparingUpdate = false;
+                menuButton.Enabled = appsButton.Enabled = recordButton.Enabled = true;
+                dialogOpen = false;
+            }
+        }
+    }
+
     private void FinishBusyOperation()
     {
         stopping = false;
@@ -778,11 +880,14 @@ internal sealed class RecorderForm : Form
     private void SetRecordingControls(bool recording)
     {
         displays.Enabled = resolutions.Enabled = profiles.Enabled = mic.Enabled = browseButton.Enabled = !recording;
-        enhance.Enabled = appsButton.Enabled = editButton.Enabled = settingsButton.Enabled = frameRates.Enabled = lightButton.Enabled = !recording;
+        enhance.Enabled = appsButton.Enabled = frameRates.Enabled = !recording;
+        editItem.Enabled = settingsItem.Enabled = updateItem.Enabled = !recording;
+        actions.Items[2].Enabled = !recording;
         pauseButton.Enabled = recording && active && !stopping;
         if (!recording) pauseButton.Text = "Пауза";
         recordButton.Enabled = true;
-        recordButton.Text = recording ? "Остановить и сохранить" : "Начать запись";
+        recordButton.Text = !recording ? "Начать запись" : testDirectory != null
+            ? "Завершить тест" : "Остановить и сохранить";
     }
 
     private void ShowError(string message)
@@ -793,6 +898,7 @@ internal sealed class RecorderForm : Form
 
     private void OnFormClosing(object sender, FormClosingEventArgs e)
     {
+        if (preparingUpdate) { e.Cancel = true; return; }
         if (recorder == null && !stopping) return;
         e.Cancel = true;
         closeAfterSave = true;
@@ -808,8 +914,9 @@ internal sealed class RecorderForm : Form
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        if (ScreenLiteUpdate.HandleArguments(args)) return;
         AppDomain.CurrentDomain.AssemblyResolve += ResolveRecorder;
         try { Run(); }
         catch (FileNotFoundException error)

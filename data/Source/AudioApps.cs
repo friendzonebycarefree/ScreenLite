@@ -220,15 +220,15 @@ internal sealed class TrackVolumeControl : UserControl
     private readonly CheckedListBox list = new CheckedListBox();
     private readonly TrackBar volume = new TrackBar();
     private readonly Label value = new Label();
-    private readonly ProgressBar original = new ProgressBar();
-    private readonly ProgressBar adjusted = new ProgressBar();
     private AudioTrack[] tracks = new AudioTrack[0];
     private bool loading;
     public int Selected { get { return list.SelectedIndex; } }
+    public AudioTrack SelectedTrack { get { return Selected < 0 ? null : tracks[Selected]; } }
+    public event EventHandler SelectionChanged;
 
     public TrackVolumeControl(int width, int listHeight)
     {
-        Size = new System.Drawing.Size(width, listHeight + 114);
+        Size = new System.Drawing.Size(width, listHeight + 47);
         list.CheckOnClick = true;
         list.IntegralHeight = false;
         list.HorizontalScrollbar = true;
@@ -237,7 +237,6 @@ internal sealed class TrackVolumeControl : UserControl
         {
             if (loading) return;
             tracks[e.Index].Enabled = e.NewValue == CheckState.Checked;
-            if (e.Index == Selected) UpdateMeters();
         };
         list.SelectedIndexChanged += delegate { if (!loading) UpdateSelection(); };
         Controls.Add(list);
@@ -253,22 +252,27 @@ internal sealed class TrackVolumeControl : UserControl
         {
             if (!loading && Selected >= 0) tracks[Selected].Volume = volume.Value;
             value.Text = volume.Value + "%";
-            UpdateMeters();
         };
         Controls.Add(volume);
         value.SetBounds(width - 60, listHeight + 12, 58, 23);
         Controls.Add(value);
-        AddMeter("Сигнал", original, width, listHeight + 50);
-        AddMeter("С уровнем", adjusted, width, listHeight + 80);
     }
 
-    private void AddMeter(string caption, ProgressBar meter, int width, int y)
+    public void FitToPanel(int minimumWidth, int maximumWidth, int maximumHeight)
     {
-        var label = new Label { Text = caption };
-        label.SetBounds(0, y, 90, 24);
-        Controls.Add(label);
-        meter.SetBounds(92, y + 3, width - 92, 14);
-        Controls.Add(meter);
+        int rows = Math.Max(1, (maximumHeight - 52) / list.ItemHeight);
+        int columns = Math.Max(1, (tracks.Length + rows - 1) / rows);
+        int columnWidth = minimumWidth;
+        foreach (AudioTrack track in tracks)
+            columnWidth = Math.Max(columnWidth, TextRenderer.MeasureText(track.Name, list.Font).Width + 30);
+        int width = (int)Math.Min(maximumWidth, (long)columnWidth * columns + (columns > 1 ? 8 : 0));
+        int height = Math.Min(rows, Math.Max(1, tracks.Length)) * list.ItemHeight + 4;
+        list.MultiColumn = columns > 1;
+        if (columns > 1) list.ColumnWidth = Math.Min(columnWidth, width);
+        list.Size = new System.Drawing.Size(width, height);
+        volume.SetBounds(0, height + 6, width - 67, 37);
+        value.SetBounds(width - 60, height + 12, 58, 23);
+        Size = new System.Drawing.Size(width, height + 47);
     }
 
     public void SetTracks(AudioTrack[] items)
@@ -289,7 +293,7 @@ internal sealed class TrackVolumeControl : UserControl
         volume.Value = Selected < 0 ? 100 : tracks[Selected].Volume;
         value.Text = volume.Value + "%";
         loading = false;
-        UpdateMeters();
+        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
     }
 
     public void SetAll(bool enabled)
@@ -297,19 +301,6 @@ internal sealed class TrackVolumeControl : UserControl
         for (int i = 0; i < tracks.Length; i++) list.SetItemChecked(i, enabled);
     }
 
-    public void UpdateMeters()
-    {
-        AudioTrack track = Selected >= 0 ? tracks[Selected] : null;
-        double peak = track == null ? 0 : track.Peak;
-        original.Value = ToMeter(peak);
-        adjusted.Value = ToMeter(track == null ? 0 : peak * track.EffectiveVolume / 100);
-    }
-
-    private static int ToMeter(double value)
-    {
-        // Log scale makes quiet voices and gain changes visible.
-        return value <= 0.001 ? 0 : (int)Math.Max(0, Math.Min(100, 100 + 100 * Math.Log10(value) / 3));
-    }
 }
 
 internal sealed class AudioPicker : Form
@@ -319,7 +310,6 @@ internal sealed class AudioPicker : Form
     private readonly AudioTrack[] items;
     private readonly AudioProject previewProject;
     private readonly AudioApp[] apps;
-    private readonly Timer meterTimer = new Timer { Interval = 350 };
     private bool polling;
     private System.Media.SoundPlayer player;
     public bool Enhance { get { return enhance.Checked; } }
@@ -340,7 +330,7 @@ internal sealed class AudioPicker : Form
         ShowInTaskbar = false;
         AutoScaleDimensions = new System.Drawing.SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new System.Drawing.Size(530, 451);
+        ClientSize = new System.Drawing.Size(530, 385);
 
         var instructions = new Label { Text = hint };
         instructions.SetBounds(16, 13, 498, 59);
@@ -349,28 +339,26 @@ internal sealed class AudioPicker : Form
         tracks.SetTracks(items);
         Controls.Add(tracks);
 
-        AddButton("Выбрать все", 16, 360, 121, DialogResult.None, delegate { tracks.SetAll(true); });
-        AddButton("Снять все", 144, 360, 102, DialogResult.None, delegate { tracks.SetAll(false); });
+        AddButton("Выбрать все", 16, 294, 121, DialogResult.None, delegate { tracks.SetAll(true); });
+        AddButton("Снять все", 144, 294, 102, DialogResult.None, delegate { tracks.SetAll(false); });
         if (chooseApps)
         {
-            AddButton("Авто", 16, 405, 74, DialogResult.Retry, null);
-            AddButton("Общий микс", 96, 405, 118, DialogResult.Ignore, null);
-            meterTimer.Tick += RefreshPeaks;
-            Shown += delegate { meterTimer.Start(); };
+            AddButton("Авто", 16, 339, 74, DialogResult.Retry, null);
+            AddButton("Общий микс", 96, 339, 118, DialogResult.Ignore, null);
+            AddButton("Проверить звук", 256, 294, 180, DialogResult.None, CheckPeak);
         }
         else
         {
             enhance.Text = "Улучшить звук";
             enhance.Checked = improve;
-            enhance.SetBounds(16, 407, 193, 26);
+            enhance.SetBounds(16, 341, 193, 26);
             Controls.Add(enhance);
-            AddButton("Прослушать фрагмент", 256, 360, 180, DialogResult.None, PlayPreview);
+            AddButton("Прослушать фрагмент", 256, 294, 180, DialogResult.None, PlayPreview);
         }
-        CancelButton = AddButton("Отмена", 271, 405, 92, DialogResult.Cancel, null);
-        AcceptButton = AddButton(chooseApps ? "Ручной режим" : "Экспорт MP4", 370, 405, 144, DialogResult.OK, null);
+        CancelButton = AddButton("Отмена", 271, 339, 92, DialogResult.Cancel, null);
+        AcceptButton = AddButton(chooseApps ? "Ручной режим" : "Экспорт MP4", 370, 339, 144, DialogResult.OK, null);
         FormClosed += delegate
         {
-            meterTimer.Dispose();
             StopPreview();
         };
     }
@@ -384,26 +372,24 @@ internal sealed class AudioPicker : Form
         return button;
     }
 
-    private async void RefreshPeaks(object sender, EventArgs e)
+    private async void CheckPeak()
     {
         if (polling || tracks.Selected < 0) return;
+        int i = tracks.Selected;
         polling = true;
         try
         {
             var peaks = await System.Threading.Tasks.Task.Run(() => AudioAppCatalog.ReadPeaks());
-            int i = tracks.Selected;
-            if (IsDisposed || i < 0) return;
+            if (IsDisposed) return;
             double peak = 0;
             foreach (int pid in apps[i].Members)
             {
                 double value;
                 if (peaks.TryGetValue(pid, out value)) peak = Math.Max(peak, value);
             }
-            items[i].Peak = peak;
-            tracks.UpdateMeters();
+            MessageBox.Show(this, SoundCheck.Result(items[i], peak), Text);
         }
-        catch (IOException) { }
-        catch (Win32Exception) { }
+        catch (Exception error) { if (!IsDisposed) MessageBox.Show(this, error.Message, Text); }
         finally { polling = false; }
     }
 
@@ -425,12 +411,23 @@ internal sealed class AudioPicker : Form
             StopPreview();
             double peak;
             var wave = previewProject.Preview(i, items[i].EffectiveVolume, out peak);
-            items[i].Peak = peak;
-            tracks.UpdateMeters();
+
             if (wave == null) return;
             player = new System.Media.SoundPlayer(wave);
             player.Play();
         }
         catch (Exception error) { MessageBox.Show(this, error.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+    }
+}
+
+internal static class SoundCheck
+{
+    public static string Result(AudioTrack track, double peak)
+    {
+        if (track.EffectiveVolume == 0) return "Дорожка отключена";
+        double level = peak * track.EffectiveVolume / 100;
+        if (level < 0.0001) return "Звук не обнаружен";
+        return level >= 1 ? "Звук есть · возможна перегрузка" :
+            "Звук есть · пик " + (20 * Math.Log10(level)).ToString("0") + " дБ";
     }
 }
